@@ -40,7 +40,7 @@ Download only the safetensors weights file from HuggingFace — no need to clone
 
 ```bash
 # Using huggingface-hub CLI
-hf download Continuous-Matches-Discrete/langflow-owt model.safetensors --local-dir ./checkpoints
+hf download Continuous-Rivals-Discrete/langflow-owt model.safetensors --local-dir ./checkpoints
 ```
 
 ### 3. Run inference
