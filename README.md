@@ -4,7 +4,7 @@
 
 </div>
 
-[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](ARXIV_LINK) [![HuggingFace](https://img.shields.io/badge/HuggingFace-langflow--owt-yellow)](https://huggingface.co/Continuous-Matches-Discrete/langflow-owt) [![Blog](https://img.shields.io/badge/Blog-Post-blue)](https://caradryanl.github.io/blog/2026/langflow/)
+[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](ARXIV_LINK) [![HuggingFace](https://img.shields.io/badge/HuggingFace-langflow--owt-yellow)](https://huggingface.co/Continuous-Rivals-Discrete/langflow-owt) [![Blog](https://img.shields.io/badge/Blog-Post-blue)](https://caradryanl.github.io/blog/2026/langflow/)
 
 By Yuxin Chen*, Chumeng Liang*, Hangke Sui, Ruihan Guo, Chaoran Cheng, Jiaxuan You, Ge Liu.
 
@@ -18,7 +18,7 @@ By Yuxin Chen*, Chumeng Liang*, Hangke Sui, Ruihan Guo, Chaoran Cheng, Jiaxuan Y
 ## TODO
 
 - [x] Inference code
-- [x] OpenWebText checkpoint on [HuggingFace](https://huggingface.co/Continuous-Matches-Discrete/langflow-owt)
+- [x] OpenWebText checkpoint on [HuggingFace](https://huggingface.co/Continuous-Rivals-Discrete/langflow-owt)
 - [ ] Training code (after paper acceptance)  
 - [ ] All trainable checkpoints (after paper acceptance)
 
