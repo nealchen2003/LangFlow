@@ -1,0 +1,21 @@
+{
+  "model_type": "LangFlow",
+  "vocab_size": 50257,
+  "hidden_size": 768,
+  "cond_dim": 128,
+  "n_blocks": 12,
+  "n_heads": 12,
+  "dropout": 0.1,
+  "model_length": 1024,
+  "use_normalized_embedding": true,
+  "embedding_norm_method": "layernorm",
+  "self_conditioning": true,
+  "use_bias": true,
+  "gumbel_loc": 4.723,
+  "gumbel_scale": 0.852,
+  "gumbel_cutoff": 1e-5,
+  "gumbel_entropy": 7.02,
+  "return_dict": true,
+  "torch_dtype": "float32",
+  "transformers_version": "4.38.2"
+}
