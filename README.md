@@ -6,7 +6,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2604.11748-b31b1b.svg)](https://arxiv.org/abs/2604.11748) [![HuggingFace](https://img.shields.io/badge/HuggingFace-langflow--owt-yellow)](https://huggingface.co/Continuous-Rivals-Discrete/langflow-owt) [![Blog](https://img.shields.io/badge/Blog-Post-blue)](https://caradryanl.github.io/blog/2026/langflow/)
 
-By Yuxin Chen*, Chumeng Liang*, Hangke Sui, Ruihan Guo, Chaoran Cheng, Jiaxuan You, Ge Liu.
+By Yuxin Chen*, Chumeng Liang*, Hangke Sui*, Ruihan Guo, Chaoran Cheng, Jiaxuan You, Ge Liu.
 
 **The first continuous diffusion language model that rivals discrete counterparts on standard language modeling benchmarks like LM1B and OpenWebText**.
 
