@@ -56,7 +56,13 @@ python inference.py \
     --output samples.txt
 ```
 
-<!-- ## Citation
+## Citation
 
-```bibtex
-``` -->
+```
+@article{chen2026langflow,
+  title={LangFlow: Continuous Diffusion Rivals Discrete in Language Modeling},
+  author={Chen, Yuxin and Liang, Chumeng and Sui, Hangke and Guo, Ruihan and Cheng, Chaoran and You, Jiaxuan and Liu, Ge},
+  journal={arXiv preprint arXiv:2604.11748},
+  year={2026}
+}
+```
