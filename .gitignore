@@ -1,2 +1,4 @@
 checkpoints/
-**/__pycache__/**assets/timeline_output.png
+__pycache__/
+assets/timeline_output.png
+.vscode/

@@ -1,0 +1,7 @@
+defaults:
+  - config
+  - override data: lm1b-wrap
+  - _self_
+
+model:
+  length: 128

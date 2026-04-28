@@ -1,0 +1,7 @@
+defaults:
+  - config
+  - override data: openwebtext-split
+  - _self_
+
+model:
+  length: 1024
