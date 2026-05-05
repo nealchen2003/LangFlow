@@ -18,6 +18,7 @@ By Yuxin Chen*, Chumeng Liang*, Hangke Sui*, Ruihan Guo, Chaoran Cheng, Jiaxuan 
 ## TODO
 
 - [x] Inference code
+- [x] PPL evaluation code
 - [x] OpenWebText checkpoint on [HuggingFace](https://huggingface.co/Continuous-Rivals-Discrete/langflow-owt)
 - [x] LM1B checkpoint on [HuggingFace](https://huggingface.co/Continuous-Rivals-Discrete/langflow-lm1b)
 - [ ] Training code (after paper acceptance)  
