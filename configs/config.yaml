@@ -16,5 +16,6 @@ loader:
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
   disable_ema: False
+  mode: flow
   n_steps: 128
   ode_method: heun2

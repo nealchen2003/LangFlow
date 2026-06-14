@@ -1,8 +1,8 @@
-"""EDLM Flow-based Perplexity Evaluation Script — Multi-GPU edition.
+"""LangFlow Perplexity Evaluation Script — Multi-GPU edition.
 
-Computes NLL via the probability flow ODE:
+Computes NLL via the probability flow ODE / SDE:
   - Reconstruction loss (CE at gamma_min)
-  - Flow integral (ODE integration of divergence)
+  - Flow integral (ODE integration of divergence) / SDE Monte Carlo
   - Prior loss (Gaussian log-prob at gamma_max)
 
 Multi-GPU usage:
@@ -118,10 +118,11 @@ def _gather_tensor(local_tensor: torch.Tensor) -> torch.Tensor:
 # Model
 # ---------------------------------------------------------------------------
 
-class LangFlowForFlowNLL(LangFlow):
-    """LangFlow with flow-based NLL computation."""
+class LangFlowNLL(LangFlow):
+    """LangFlow with NLL computation."""
 
-    def _pred_x_and_div(self, z_t, gamma, use_self_cond=False, attention_mask=None):
+    def _pred_x_and_div(self, z_t, gamma, use_self_cond=False, attention_mask=None,
+                        sc_chain_rule=False):
         B, L, D = z_t.shape
         u = torch.randn_like(z_t)
         if attention_mask is not None:
@@ -137,7 +138,9 @@ class LangFlowForFlowNLL(LangFlow):
         if use_self_cond and self.config.self_conditioning:
             logits_sc = self.forward(noisy_embeds=z, timesteps=gamma_batch, x_self_cond=None, return_dict=False)
             probs_sc = F.softmax(logits_sc, dim=-1)
-            x_self_cond = self._embed_tokens(probs_sc).detach()
+            x_self_cond = self._embed_tokens(probs_sc)
+            if not sc_chain_rule:
+                x_self_cond = x_self_cond.detach()
 
         logits = self.forward(noisy_embeds=z, timesteps=gamma_batch, x_self_cond=x_self_cond, return_dict=False)
         probs = F.softmax(logits, dim=-1)
@@ -153,7 +156,7 @@ class LangFlowForFlowNLL(LangFlow):
         return x_reconst, div
 
     def compute_flow_nll(self, x0, n_steps=128, ode_method="euler", use_self_cond=True,
-                         attention_mask=None):
+                         attention_mask=None, sc_chain_rule=False):
         B, L = x0.shape
         device = x0.device
         dtype = torch.float32
@@ -196,7 +199,8 @@ class LangFlowForFlowNLL(LangFlow):
             z_scaled = y[:, 1:].reshape(B, L, D)
             z_t = z_scaled * sigma
             x_reconst, x_div = self._pred_x_and_div(
-                z_t, gamma, use_self_cond=use_self_cond, attention_mask=attention_mask)
+                z_t, gamma, use_self_cond=use_self_cond, attention_mask=attention_mask,
+                sc_chain_rule=sc_chain_rule)
             div_scaled = sigma * x_div
             v = x_reconst.reshape(B, -1)
             return torch.cat([div_scaled.view(B, 1), v], dim=1).detach()
@@ -234,7 +238,78 @@ class LangFlowForFlowNLL(LangFlow):
         return {
             "nll": reconst_nll + flow_nll + prior_nll,
             "reconst_nll": reconst_nll,
-            "flow_nll": flow_nll,
+            "int_nll": flow_nll,
+            "prior_nll": prior_nll,
+            "num_valid_tokens": num_valid_tokens,
+        }
+
+    @torch.no_grad()
+    def compute_sde_nll(self, x0, n_monte_carlo=128, use_self_cond=True,
+                         attention_mask=None):
+        B, L = x0.shape
+        device = x0.device
+        dtype = torch.float32
+
+        if attention_mask is not None:
+            attention_mask = torch.ones(B, L, device=x0.device, dtype=bool)
+        attention_mask = attention_mask.to(dtype)
+
+        x_embed = self._embed_tokens(x0).to(dtype)
+        
+        def _add_noise(gamma):
+            gamma = gamma.view(*gamma.shape, *[1] * (x_embed.ndim - gamma.ndim))
+            alpha = torch.sigmoid(-gamma).sqrt()
+            sigma = torch.sigmoid(gamma).sqrt()
+            return alpha * x_embed + sigma * torch.randn_like(x_embed)
+
+        gamma_0 = torch.tensor(self.proposal.gamma_min, device=device, dtype=dtype)
+        z_0 = _add_noise(gamma_0)
+
+        # === 1. Reconstruction loss at gamma_0 ===
+        gamma_batch = gamma_0.expand(B)
+
+        x_self_cond = None
+        if use_self_cond and self.config.self_conditioning:
+            logits_sc = self.forward(noisy_embeds=z_0, timesteps=gamma_batch, x_self_cond=None, return_dict=False)
+            probs_sc = F.softmax(logits_sc, dim=-1)
+            x_self_cond = self._embed_tokens(probs_sc)
+
+        logits = self.forward(noisy_embeds=z_0, timesteps=gamma_batch, x_self_cond=x_self_cond, return_dict=False)
+        reconst_nll_per_token = F.cross_entropy(
+            logits.flatten(0, 1), x0.flatten(), reduction="none"
+        ).reshape(B, L)
+        reconst_nll = (reconst_nll_per_token * attention_mask).sum(dim=1)
+
+        # === 2. SDE Monte Carlo ===
+        int_nll = 0.0
+        for _ in range(n_monte_carlo):
+            gamma = self.proposal(torch.rand(B, device=device))
+            log_pdf = self.proposal.log_pdf(gamma)
+            z_t = _add_noise(gamma)
+            x_self_cond = None
+            if use_self_cond and self.config.self_conditioning:
+                logits_sc = self.forward(noisy_embeds=z_t, timesteps=gamma, x_self_cond=None, return_dict=False)
+                probs_sc = F.softmax(logits_sc, dim=-1)
+                x_self_cond = self._embed_tokens(probs_sc)
+
+            logits = self.forward(noisy_embeds=z_t, timesteps=gamma, x_self_cond=x_self_cond, return_dict=False)
+            z_hat = self._embed_tokens(F.softmax(logits, dim=-1))
+            int_nll_per_token = 0.5 * torch.exp(-gamma - log_pdf)[:, None] * (z_hat - x_embed).square().sum(dim=2)
+            int_nll += (int_nll_per_token * attention_mask).sum(dim=1)
+
+        int_nll /= n_monte_carlo
+
+        # === 3. Prior loss at gamma_1 ===
+        import numpy as np
+        prior_nll_per_token = 0.5 * np.exp(-self.proposal.gamma_max) * x_embed.square().sum(2)
+        prior_nll = (prior_nll_per_token * attention_mask).sum(dim=1)
+
+        num_valid_tokens = attention_mask.sum(dim=1).long()
+
+        return {
+            "nll": reconst_nll + int_nll + prior_nll,
+            "reconst_nll": reconst_nll,
+            "int_nll": int_nll,
             "prior_nll": prior_nll,
             "num_valid_tokens": num_valid_tokens,
         }
@@ -246,7 +321,7 @@ class LangFlowForFlowNLL(LangFlow):
 
 def _load_from_checkpoint(config, tokenizer):
     local_device = f"cuda:{_rank()}"
-    model = LangFlowForFlowNLL.from_pretrained(
+    model = LangFlowNLL.from_pretrained(
         config.eval.checkpoint_path,
         torch_dtype=torch.float32,
     )
@@ -310,24 +385,30 @@ def _build_distributed_loader(config, tokenizer, rank, world_size):
 # Main eval function
 # ---------------------------------------------------------------------------
 
-def _eval_langflow_flow_ppl(config, logger, tokenizer):
-    """Evaluate LangFlow perplexity using flow-based NLL — multi-GPU aware.
+def _eval_langflow_ppl(config, logger, tokenizer):
+    """Evaluate LangFlow perplexity using Flow/SDE NLL — multi-GPU aware.
 
     Each GPU processes its own shard of the validation set in parallel.
     Per-device average NLL values are token-weighted when aggregating across
     ranks, so unequal last batches and uneven shards are handled correctly.
     """
+    mode = config.eval.get("mode", "flow")
     nfe = getattr(config.eval, 'n_steps', 128)
     ode_method = getattr(config.eval, 'ode_method', 'euler')
+    n_monte_carlo = getattr(config.eval, 'n_monte_carlo', 128)
 
     rank = _rank()
     world_size = _world_size()
     local_device = torch.device(f"cuda:{rank}")
 
     if _is_main_process():
-        logger.info("Starting LangFlow Flow-based PPL Evaluation.")
+        logger.info("Starting LangFlow PPL Evaluation.")
         logger.info(f"World size (GPUs): {world_size}")
-        logger.info(f"NFE: {nfe}, ODE method: {ode_method}")
+        logger.info(f"Mode: {mode}")
+        if mode == "sde":
+            logger.info(f"Monte Carlo samples: {n_monte_carlo}")
+        else:
+            logger.info(f"NFE: {nfe}, ODE method: {ode_method}")
 
     # --- Load model (every rank gets its own copy, already on local_device) ---
     model = _load_from_checkpoint(config, tokenizer)
@@ -347,6 +428,7 @@ def _eval_langflow_flow_ppl(config, logger, tokenizer):
         model.ema.copy_to(model.parameters())
 
     use_self_cond = config.eval.get("use_self_cond", model.config.self_conditioning)
+    sc_chain_rule = mode == "sc_chain_rule"
 
     loader = _build_distributed_loader(config, tokenizer, rank, world_size)
 
@@ -355,14 +437,18 @@ def _eval_langflow_flow_ppl(config, logger, tokenizer):
     # sizes are handled correctly when computing the token-weighted average.
     local_nll_sum     = 0.0
     local_reconst_sum = 0.0
-    local_flow_sum    = 0.0
+    local_int_sum     = 0.0
     local_prior_sum   = 0.0
     local_tokens      = 0
     local_num_seqs    = 0
     seq_len           = None
 
-    with tqdm(loader, desc=f"[rank {rank}] Flow PPL (NFE={nfe})",
-              disable=not _is_main_process()) as pbar:
+    pbar_desc = (
+        f"[rank {rank}] NLL (NMC={n_monte_carlo})"
+        if mode == "sde"
+        else f"[rank {rank}] NLL (NFE={nfe})"
+    )
+    with tqdm(loader, desc=pbar_desc, disable=not _is_main_process()) as pbar:
         for batch in pbar:
             x0 = batch['input_ids'].to(local_device)   # (B, L)
             B, seq_len = x0.shape
@@ -370,15 +456,21 @@ def _eval_langflow_flow_ppl(config, logger, tokenizer):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(local_device)
 
-            losses = model.compute_flow_nll(
-                x0, n_steps=nfe, ode_method=ode_method, use_self_cond=use_self_cond,
-                attention_mask=attention_mask,
-            )
+            if mode == "sde":
+                losses = model.compute_sde_nll(
+                    x0, n_monte_carlo=n_monte_carlo, use_self_cond=use_self_cond,
+                    attention_mask=attention_mask,
+                )
+            else:
+                losses = model.compute_flow_nll(
+                    x0, n_steps=nfe, ode_method=ode_method, use_self_cond=use_self_cond,
+                    attention_mask=attention_mask, sc_chain_rule=sc_chain_rule,
+                )
 
             # losses['nll'] etc. are per-sequence sums (shape: [B])
             local_nll_sum     += losses['nll'].detach().sum().item()
             local_reconst_sum += losses['reconst_nll'].detach().sum().item()
-            local_flow_sum    += losses['flow_nll'].detach().sum().item()
+            local_int_sum += losses['int_nll'].detach().sum().item()
             local_prior_sum   += losses['prior_nll'].detach().sum().item()
             local_tokens      += losses['num_valid_tokens'].sum().item()
             local_num_seqs    += B
@@ -407,7 +499,7 @@ def _eval_langflow_flow_ppl(config, logger, tokenizer):
 
     gathered_nll_sum     = _gather_tensor(_scalar_to_cuda(local_nll_sum))
     gathered_reconst_sum = _gather_tensor(_scalar_to_cuda(local_reconst_sum))
-    gathered_flow_sum    = _gather_tensor(_scalar_to_cuda(local_flow_sum))
+    gathered_int_sum     = _gather_tensor(_scalar_to_cuda(local_int_sum))
     gathered_prior_sum   = _gather_tensor(_scalar_to_cuda(local_prior_sum))
     gathered_tokens      = _gather_tensor(_scalar_to_cuda(local_tokens))
     gathered_num_seqs    = _gather_tensor(_scalar_to_cuda(local_num_seqs))
@@ -420,7 +512,7 @@ def _eval_langflow_flow_ppl(config, logger, tokenizer):
 
     global_avg_nll_per_token     = gathered_nll_sum.sum().item()     / total_tokens
     global_avg_reconst_per_token = gathered_reconst_sum.sum().item() / total_tokens
-    global_avg_flow_per_token    = gathered_flow_sum.sum().item()     / total_tokens
+    global_avg_int_per_token     = gathered_int_sum.sum().item()     / total_tokens
     global_avg_prior_per_token   = gathered_prior_sum.sum().item()    / total_tokens
 
     num_samples = int(gathered_num_seqs.sum().item())
@@ -429,7 +521,7 @@ def _eval_langflow_flow_ppl(config, logger, tokenizer):
     # Convert per-token NLL back to per-sequence for reporting
     global_avg_nll_per_seq     = global_avg_nll_per_token     * avg_valid_tokens_per_seq
     global_avg_reconst_per_seq = global_avg_reconst_per_token * avg_valid_tokens_per_seq
-    global_avg_flow_per_seq    = global_avg_flow_per_token    * avg_valid_tokens_per_seq
+    global_avg_int_per_seq     = global_avg_int_per_token     * avg_valid_tokens_per_seq
     global_avg_prior_per_seq   = global_avg_prior_per_token   * avg_valid_tokens_per_seq
     ppl = torch.exp(torch.tensor(global_avg_nll_per_token)).item()
 
@@ -439,38 +531,47 @@ def _eval_langflow_flow_ppl(config, logger, tokenizer):
     gumbel_scale = scale.item() if hasattr(scale, 'item') else float(scale)
 
     print("=" * 60)
-    print("LangFlow Flow-based PPL Evaluation Results (Multi-GPU)")
+    print("LangFlow PPL Evaluation Results (Multi-GPU)")
     print("=" * 60)
     print(f"Checkpoint: {config.eval.checkpoint_path}")
     print(f"GPUs used: {world_size}")
-    print(f"NFE: {nfe}, ODE method: {ode_method}")
-    print(f"Self-conditioning: {'ENABLED' if model.self_conditioning else 'DISABLED'}")
+    print(f"Mode: {mode}")
+    if mode == "sde":
+        print(f"Monte Carlo samples: {n_monte_carlo}")
+    else:
+        print(f"NFE: {nfe}, ODE method: {ode_method}")
+    print(f"Self-conditioning: {'ENABLED' if model.config.self_conditioning else 'DISABLED'}")
     print(f"Gumbel loc: {gumbel_loc:.4f}, scale: {gumbel_scale:.4f}")
     print(f"Samples: {num_samples}, Seq len: {seq_len}")
     print("-" * 60)
     print(f"Reconstruction NLL (per seq): {global_avg_reconst_per_seq:.4f}")
-    print(f"Flow NLL (per seq):           {global_avg_flow_per_seq:.4f}")
+    print(f"Integral NLL (per seq):       {global_avg_int_per_seq:.4f}")
     print(f"Prior NLL (per seq):          {global_avg_prior_per_seq:.4f}")
     print(f"Total NLL (per seq):          {global_avg_nll_per_seq:.4f}")
     print(f"NLL (per token):              {global_avg_nll_per_token:.4f}")
     print(f"Perplexity:                   {ppl:.4f}")
     print("=" * 60)
 
-    return {
+    results = {
         'nll_per_seq': global_avg_nll_per_seq,
         'nll_per_token': global_avg_nll_per_token,
         'ppl': ppl,
         'reconst_nll': global_avg_reconst_per_seq,
-        'flow_nll': global_avg_flow_per_seq,
+        'int_nll': global_avg_int_per_seq,
         'prior_nll': global_avg_prior_per_seq,
-        'nfe': nfe,
-        'ode_method': ode_method,
+        'mode': mode,
         'num_samples': num_samples,
         'world_size': world_size,
         'seq_len': seq_len,
         'gumbel_loc': gumbel_loc,
         'gumbel_scale': gumbel_scale,
     }
+    if mode == "sde":
+        results['n_monte_carlo'] = n_monte_carlo
+    else:
+        results['nfe'] = nfe
+        results['ode_method'] = ode_method
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +585,14 @@ def _save_results_json(results, config, logger):
     checkpoint_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    nfe = results.get('nfe', 128)
-    ode_method = results.get('ode_method', 'euler')
-    
-    output_filename = f"flow_ppl_{checkpoint_name}_nfe{nfe}_{ode_method}_{timestamp}.json"
+    mode = results.get('mode', config.eval.get("mode", "flow"))
+    if mode == "sde":
+        n_monte_carlo = results.get('n_monte_carlo', 128)
+        output_filename = f"{mode}_ppl_{checkpoint_name}_nmc{n_monte_carlo}_{timestamp}.json"
+    else:
+        nfe = results.get('nfe', 128)
+        ode_method = results.get('ode_method', 'euler')
+        output_filename = f"{mode}_ppl_{checkpoint_name}_nfe{nfe}_{ode_method}_{timestamp}.json"
     output_path = os.path.join(checkpoint_dir, output_filename)
     
     results_with_config = {
@@ -522,7 +627,7 @@ def main(config):
         L.seed_everything(config.seed + _rank())
         logger = utils.get_logger(__name__)
         tokenizer = dataloader.get_tokenizer(config)
-        results = _eval_langflow_flow_ppl(config, logger, tokenizer)
+        results = _eval_langflow_ppl(config, logger, tokenizer)
         
         # Only rank-0 saves results
         if _is_main_process() and results:
