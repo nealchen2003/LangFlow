@@ -250,9 +250,10 @@ class LangFlowNLL(LangFlow):
         device = x0.device
         dtype = torch.float32
 
-        if attention_mask is not None:
-            attention_mask = torch.ones(B, L, device=x0.device, dtype=bool)
-        attention_mask = attention_mask.to(dtype)
+        if attention_mask is None:
+            attention_mask = torch.ones(B, L, device=device, dtype=dtype)
+        else:
+            attention_mask = attention_mask.to(device=device, dtype=dtype)
 
         x_embed = self._embed_tokens(x0).to(dtype)
         
