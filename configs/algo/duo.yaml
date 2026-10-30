@@ -1,0 +1,16 @@
+name: duo
+backbone: dit  # dit / hf_dit
+parameterization: mean
+time_conditioning: True
+T: 0
+causal_attention: False
+ignore_bos: False
+loss_type: elbo
+# Gaussian-relaxation curriculum (see the Duo paper).
+gumbel_tau_log10_start: -1.0
+gumbel_tau_log10_end: -2.0
+curriculum_start: 100_000
+curriculum_end: 200_000
+gamma_min: -3.5
+gamma_max: -1.75
+integral_cache_path: ${hydra:runtime.cwd}/integral/${data.tokenizer_name_or_path}.pkl

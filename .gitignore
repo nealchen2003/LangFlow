@@ -1,4 +1,6 @@
 checkpoints/
+outputs/
+wandb/
 __pycache__/
 assets/timeline_output.png
 .vscode/

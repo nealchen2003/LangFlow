@@ -1,560 +1,362 @@
-"""HuggingFace model implementation for LangFlow.
+"""LangFlow: continuous flow-matching language model in embedding space.
 
-LangFlow is a continuous diffusion language model that operates in embedding space.
+`LangFlowMixin` holds everything LangFlow-specific (denoiser with the skip
+connection, ODE / SDE samplers, ODE likelihood). It is shared by the
+HuggingFace model below and by the Lightning trainer in `algo.py`.
 """
 
 import math
 import typing
 
-import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 
 from .config import LangFlowConfig
-
-
-# Flags required to enable jit fusion kernels
-torch._C._jit_set_profiling_mode(False)
-torch._C._jit_set_profiling_executor(False)
-torch._C._jit_override_can_fuse_on_cpu(True)
-torch._C._jit_override_can_fuse_on_gpu(True)
-
-
-def bias_dropout_add_scale(
-    x: torch.Tensor,
-    bias: typing.Optional[torch.Tensor],
-    scale: torch.Tensor,
-    residual: typing.Optional[torch.Tensor],
-    prob: float,
-    training: bool) -> torch.Tensor:
-    if bias is not None:
-        out = scale * F.dropout(x + bias, p=prob, training=training)
-    else:
-        out = scale * F.dropout(x, p=prob, training=training)
-
-    if residual is not None:
-        out = residual + out
-    return out
-
-
-@torch.jit.script
-def bias_dropout_add_scale_fused_train(
-    x: torch.Tensor,
-    bias: typing.Optional[torch.Tensor],
-    scale: torch.Tensor,
-    residual: typing.Optional[torch.Tensor],
-    prob: float) -> torch.Tensor:
-    return bias_dropout_add_scale(x, bias, scale, residual, prob, True)
-
-
-@torch.jit.script
-def bias_dropout_add_scale_fused_inference(
-    x: torch.Tensor,
-    bias: typing.Optional[torch.Tensor],
-    scale: torch.Tensor,
-    residual: typing.Optional[torch.Tensor],
-    prob: float) -> torch.Tensor:
-    return bias_dropout_add_scale(x, bias, scale, residual, prob, False)
-
-
-@torch.jit.script
-def modulate_fused(x: torch.Tensor,
-                   shift: torch.Tensor,
-                   scale: torch.Tensor) -> torch.Tensor:
-    return x * (1 + scale) + shift
-
-
-class Rotary(nn.Module):
-    def __init__(self, dim, base=10_000):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
-
-    def forward(self, x, seq_dim=1):
-        seq_len = x.shape[seq_dim]
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq.clone())
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.cos_cached = emb.cos()[None, :, None, None, :].repeat(1, 1, 3, 1, 1)
-            self.sin_cached = emb.sin()[None, :, None, None, :].repeat(1, 1, 3, 1, 1)
-            self.cos_cached[:, :, 2, :, :].fill_(1.)
-            self.sin_cached[:, :, 2, :, :].fill_(0.)
-        return self.cos_cached, self.sin_cached
-
-
-def _apply_rotary_emb(x, cos, sin):
-    # x: [batch, seqlen, nheads, headdim]
-    # cos, sin: [seqlen, headdim//2]
-    ro_dim = cos.shape[-1] * 2
-    # Expand to [1, seqlen, 1, ro_dim] for broadcasting
-    cos = torch.cat([cos, cos], dim=-1)[None, :, None, :]
-    sin = torch.cat([sin, sin], dim=-1)[None, :, None, :]
-    x_rot = x[..., :ro_dim]
-    x1, x2 = x_rot.chunk(2, dim=-1)
-    x_rotated = torch.cat([-x2, x1], dim=-1)
-    return torch.cat([x_rot * cos + x_rotated * sin, x[..., ro_dim:]], dim=-1)
-
-
-def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
-    with torch.autocast(device_type='cuda', enabled=False):
-        cos, sin = rotary_cos_sin
-        cos = cos.to(qkv.dtype)
-        sin = sin.to(qkv.dtype)
-        cos = cos[0, :, 0, 0, :cos.shape[-1]//2]
-        sin = sin[0, :, 0, 0, :sin.shape[-1]//2]
-        q, k, v = qkv.chunk(3, dim=2)
-        q = _apply_rotary_emb(q.squeeze(dim=2), cos, sin)
-        k = _apply_rotary_emb(k.squeeze(dim=2), cos, sin)
-        v = v.squeeze(dim=2)
-    return q, k, v
-
-
-def regular_attention_multi_headed(q, k, v):
-    attention_output = F.scaled_dot_product_attention(
-        query=q.transpose(1, 2),
-        key=k.transpose(1, 2),
-        value=v.transpose(1, 2),
-        attn_mask=None,
-        dropout_p=0.0,
-        is_causal=False)
-    attention_output = attention_output.transpose(1, 2)
-    return einops.rearrange(attention_output, 'b s h d -> b s (h d)')
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones([dim]))
-        self.dim = dim
-
-    def forward(self, x):
-        with torch.autocast(device_type='cuda', enabled=False):
-            x = F.layer_norm(x.float(), [self.dim])
-        return x * self.weight[None, None, :]
-
-
-class TimestepEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations."""
-    
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True))
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
-            / half)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-
-
-class DDiTBlock(nn.Module):
-    def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1):
-        super().__init__()
-        self.n_heads = n_heads
-
-        self.norm1 = LayerNorm(dim)
-        self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.attn_out = nn.Linear(dim, dim, bias=False)
-
-        self.norm2 = LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_ratio * dim, bias=True),
-            nn.GELU(approximate='tanh'),
-            nn.Linear(mlp_ratio * dim, dim, bias=True))
-        self.dropout = dropout
-
-        self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim)
-        self.adaLN_modulation.weight.data.zero_()
-        self.adaLN_modulation.bias.data.zero_()
-
-    def _get_bias_dropout_scale(self):
-        if self.training:
-            return bias_dropout_add_scale_fused_train
-        else:
-            return bias_dropout_add_scale_fused_inference
-
-    def forward(self, x, rotary_cos_sin, c):
-        bias_dropout_scale_fn = self._get_bias_dropout_scale()
-
-        x_skip = x
-        x = self.norm1(x)
-
-        (shift_msa, scale_msa, gate_msa, shift_mlp,
-         scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
-        x = modulate_fused(x, shift_msa, scale_msa)
-
-        qkv = einops.rearrange(
-            self.attn_qkv(x),
-            'b s (three h d) -> b s three h d',
-            three=3,
-            h=self.n_heads)
-        q, k, v = split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin)
-        x = regular_attention_multi_headed(q, k, v)
-
-        x = bias_dropout_scale_fn(self.attn_out(x), None, gate_msa, x_skip, self.dropout)
-        x = bias_dropout_scale_fn(
-            self.mlp(modulate_fused(self.norm2(x), shift_mlp, scale_mlp)),
-            None, gate_mlp, x, self.dropout)
-        return x
-
-
-def _normalize_embedding_layernorm(weight: torch.Tensor) -> torch.Tensor:
-    """Normalize embedding weights to unit norm per row, then scale by sqrt(dim)."""
-    normalized = F.normalize(weight.float(), dim=-1)
-    return (normalized * math.sqrt(weight.shape[-1])).to(weight.dtype)
-
-
-class EmbeddingLayer(nn.Module):
-    """Embedding layer with optional layernorm normalization."""
-    
-    def __init__(self, dim, vocab_dim, use_normalized_embedding=True):
-        super().__init__()
-        self.dim = dim
-        self.vocab_dim = vocab_dim
-        self.use_normalized_embedding = use_normalized_embedding
-        self.embedding = nn.Parameter(torch.empty((vocab_dim, dim)))
-        nn.init.kaiming_uniform_(self.embedding, a=math.sqrt(5))
-
-    def _get_embedding(self):
-        if self.use_normalized_embedding:
-            return _normalize_embedding_layernorm(self.embedding)
-        return self.embedding
-
-    def forward(self, x):
-        embedding = self._get_embedding()
-        if x.ndim == 2:
-            return embedding[x]
-        assert x.ndim == 3  # probabilities
-        return torch.einsum("blv,ve->ble", x.float(), embedding.float()).to(x.dtype)
-
-
-class DDiTFinalLayer(nn.Module):
-    def __init__(self, hidden_size, out_channels, cond_dim):
-        super().__init__()
-        self.norm_final = LayerNorm(hidden_size)
-        self.linear = nn.Linear(hidden_size, out_channels)
-        self.linear.weight.data.zero_()
-        self.linear.bias.data.zero_()
-        self.adaLN_modulation = nn.Linear(cond_dim, 2 * hidden_size, bias=True)
-        self.adaLN_modulation.weight.data.zero_()
-        self.adaLN_modulation.bias.data.zero_()
-
-    def forward(self, x, c):
-        x = self.norm_final(x)
-        shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
-        x = modulate_fused(x, shift, scale)
-        x = self.linear(x)
-        return x
+from .dit import DIT
 
 
 class GumbelProposal(nn.Module):
-    """Learnable Gumbel distribution proposal for sampling gamma (log-SNR)."""
-    
-    def __init__(self, loc: float = 4.723, scale: float = 0.852, 
-                 cutoff: float = 1e-5, entropy: float = 7.02):
-        super().__init__()
-        self.loc = nn.Parameter(torch.tensor(loc))
-        self.scale = nn.Parameter(torch.tensor(scale))
-        self.cutoff = cutoff
-        self.entropy = nn.Parameter(torch.tensor(entropy))
+  """Gumbel distribution over gamma (log-NSR), used as noise schedule.
 
-    def _get_distribution(self) -> torch.distributions.Gumbel:
-        return torch.distributions.Gumbel(self.loc, self.scale)
+  With `learnable=True` (the LangFlow default), `loc`, `scale` and `entropy`
+  are parameters fitted by `fit_loss` so that the CDF tracks the per-gamma
+  cross-entropy. With `learnable=False` the distribution is fixed.
+  """
 
-    @property
-    def gamma_min(self) -> float:
-        return float(self.loc - math.log(-math.log(self.cutoff)) * self.scale)
+  def __init__(self, loc: float, scale: float, cutoff: float = 1e-5,
+               entropy: float = 7.02, learnable: bool = True):
+    super().__init__()
+    self.cutoff = cutoff
+    if learnable:
+      self.loc = nn.Parameter(torch.tensor(loc))
+      self.scale = nn.Parameter(torch.tensor(scale))
+      self.entropy = nn.Parameter(torch.tensor(entropy))
+    else:
+      self.loc, self.scale, self.entropy = loc, scale, None
 
-    @property
-    def gamma_max(self) -> float:
-        return float(self.loc - math.log(self.cutoff) * self.scale)
+  def _dist(self) -> torch.distributions.Gumbel:
+    return torch.distributions.Gumbel(self.loc, self.scale)
 
-    def forward(self, q: torch.Tensor) -> torch.Tensor:
-        """Convert uniform samples to gamma values via inverse CDF."""
-        gamma = self._get_distribution().icdf(q)
-        return gamma.clamp(min=self.gamma_min, max=self.gamma_max)
+  def _quantile(self, coef):
+    value = self.loc - coef * self.scale
+    return float(value.detach() if torch.is_tensor(value) else value)
 
-    def log_pdf(self, gamma: torch.Tensor) -> torch.Tensor:
-        """Compute log probability density at gamma."""
-        return self._get_distribution().log_prob(gamma)
+  @property
+  def gamma_min(self) -> float:
+    return self._quantile(math.log(-math.log(self.cutoff)))
 
+  @property
+  def gamma_max(self) -> float:
+    return self._quantile(math.log(self.cutoff))
 
-class LangFlowBackbone(nn.Module):
-    """DiT backbone for LangFlow."""
-    
-    def __init__(self, config: LangFlowConfig):
-        super().__init__()
-        self.config = config
-        dim = config.hidden_size
-        cond_dim = config.cond_dim
+  def forward(self, q: torch.Tensor) -> torch.Tensor:
+    """Maps uniform samples / quantiles in (0, 1) to gamma (inverse CDF)."""
+    return self._dist().icdf(q).clamp(min=self.gamma_min, max=self.gamma_max)
 
-        self.vocab_embed = EmbeddingLayer(
-            dim, config.vocab_size,
-            use_normalized_embedding=config.use_normalized_embedding)
-        self.sigma_map = TimestepEmbedder(cond_dim)
-        self.rotary_emb = Rotary(dim // config.n_heads)
+  def log_pdf(self, gamma: torch.Tensor) -> torch.Tensor:
+    return self._dist().log_prob(gamma)
 
-        self.blocks = nn.ModuleList([
-            DDiTBlock(dim=dim, n_heads=config.n_heads, cond_dim=cond_dim, dropout=config.dropout)
-            for _ in range(config.n_blocks)
-        ])
-
-        self.output_layer = DDiTFinalLayer(
-            hidden_size=dim, out_channels=config.vocab_size, cond_dim=cond_dim)
-
-        # Self-conditioning projection
-        if config.self_conditioning:
-            self.self_cond_proj = nn.Linear(dim * 2, dim, bias=False)
-            nn.init.zeros_(self.self_cond_proj.weight)
-
-    def forward(self, x_embed, sigma, x_self_cond=None, output_hidden_states=False):
-        """Forward pass from embeddings.
-        
-        Args:
-            x_embed: [B, L, D] - Input embeddings (possibly noisy)
-            sigma: [B] - Gamma values (log-SNR)
-            x_self_cond: [B, L, D] - Self-conditioning embeddings (optional)
-            output_hidden_states: Whether to return all hidden states
-        
-        Returns:
-            logits: [B, L, vocab_size]
-            hidden_states: List of hidden states if output_hidden_states=True
-        """
-        all_hidden_states = []
-        x = x_embed
-        
-        if output_hidden_states:
-            all_hidden_states.append(x)
-
-        # Self-conditioning
-        if self.config.self_conditioning:
-            if x_self_cond is None:
-                x_self_cond = torch.zeros_like(x)
-            x = x + self.self_cond_proj(torch.cat([x, x_self_cond], dim=-1))
-
-        t_cond = F.silu(self.sigma_map(sigma))
-        rotary_cos_sin = self.rotary_emb(x)
-
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            for block in self.blocks:
-                x = block(x, rotary_cos_sin, c=t_cond)
-                if output_hidden_states:
-                    all_hidden_states.append(x)
-            x = self.output_layer(x, c=t_cond)
-
-        return x, all_hidden_states
+  def fit_loss(self, gamma: torch.Tensor, loss: torch.Tensor) -> torch.Tensor:
+    """(entropy * CDF(gamma) - loss)^2; `loss` must be detached."""
+    if self.entropy is None:
+      return torch.zeros_like(gamma)
+    return (self.entropy * self._dist().cdf(gamma) - loss) ** 2
 
 
-class LangFlow(transformers.PreTrainedModel):
-    """HuggingFace-compatible LangFlow model.
-    
-    LangFlow is a continuous diffusion language model that operates in embedding space.
-    It uses a DiT (Diffusion Transformer) backbone with:
-    - Self-conditioning: uses previous predictions as additional input
-    - Bias (preconditioning): skip connection for improved generation
-    - Normalized embeddings: layernorm on embedding vectors
-    - Learnable Gumbel proposal for gamma (log-SNR) sampling
+class LangFlowMixin:
+  """LangFlow computations shared by the HF model and the Lightning trainer.
+
+  The host class provides `backbone` (a `DIT` with self-conditioning),
+  `proposal` (a `GumbelProposal`), `self_conditioning` and `_bias_scale()`.
+  Noise levels are log-NSRs `gamma`: z = sqrt(sigmoid(-gamma)) x
+  + sqrt(sigmoid(gamma)) eps.
+  """
+
+  def _embed_tokens(self, x: torch.Tensor) -> torch.Tensor:
+    """Token ids [B, L] or probabilities [B, L, V] -> embeddings [B, L, D]."""
+    return self.backbone.vocab_embed(x)
+
+  def _forward_diffusion(self, x_embed, gamma):
+    gamma = gamma.float()
+    alpha = torch.sigmoid(-gamma).sqrt()[:, None, None]
+    sigma = torch.sigmoid(gamma).sqrt()[:, None, None]
+    noise = torch.randn_like(x_embed)
+    return (x_embed * alpha + noise * sigma).to(x_embed.dtype)
+
+  def denoise(self, z, gamma, x_self_cond=None, output_hidden_states=False):
+    """Logits [B, L, V] of the clean tokens given noisy embeddings z [B, L, D].
+
+    gamma: [B] (a [B, L] tensor is averaged over L). Adds the preconditioning
+    skip connection c_skip(gamma) * z @ E^T.
     """
-    config_class = LangFlowConfig
-    base_model_prefix = "langflow"
+    if gamma.ndim == 2:
+      gamma = gamma.mean(-1)
+    if gamma.ndim == 0:
+      gamma = gamma.unsqueeze(0)
+    with torch.autocast(device_type='cuda', dtype=torch.float32):
+      logits, hidden_states = self.backbone.forward_from_embed(
+        z, gamma, x_self_cond=x_self_cond, output_hidden_states=True)
+      bias_scale = self._bias_scale()
+      if bias_scale > 0:
+        c_skip = ((F.softplus(-gamma) - gamma) / 2).exp() * bias_scale
+        embedding = self.backbone.vocab_embed._get_embedding()
+        skip_logits = torch.matmul(z.float(), embedding.t().float())
+        logits = logits + c_skip[:, None, None] * skip_logits.to(logits.dtype)
+    if output_hidden_states:
+      return logits, hidden_states
+    return logits
 
-    def __init__(self, config: LangFlowConfig):
-        super().__init__(config)
-        self.config = config
-        self.backbone = LangFlowBackbone(config)
-        self.proposal = GumbelProposal(
-            loc=config.gumbel_loc,
-            scale=config.gumbel_scale,
-            cutoff=config.gumbel_cutoff,
-            entropy=config.gumbel_entropy)
+  def _x0_pred(self, z, gamma, x_self_cond, temperature=1.0):
+    """Denoised embedding E^T softmax(logits / temperature)."""
+    logits = self.denoise(z, gamma, x_self_cond).float()
+    if temperature != 1.0:
+      logits = logits / temperature
+    return self._embed_tokens(F.softmax(logits, dim=-1))
 
-    def _get_embedding_matrix(self) -> torch.Tensor:
-        """Get the embedding matrix for bias skip connection."""
-        return self.backbone.vocab_embed._get_embedding()
+  @staticmethod
+  def _euler_step(z, x_pred, t, s):
+    """Euler step of the probability-flow ODE from log-NSR t to s."""
+    t_, s_ = t.double(), s.double()
+    cur = z.double() * ((F.softplus(t_) - F.softplus(s_)) / 2).exp()
+    end = torch.sigmoid(-s_).sqrt() * x_pred.double()
+    return end.lerp(cur, ((s_ - t_) / 2).exp()).to(z.dtype)
 
-    def _embed_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """Embed tokens or probabilities to continuous embeddings."""
-        return self.backbone.vocab_embed(x)
+  @torch.no_grad()
+  def sample(self, num_samples, seq_length, num_steps, sampler='ode',
+             temperature=1.0, sde_offset=0.1, sde_mode='elf', eps=1e-5,
+             device=None):
+    """Generates token ids [num_samples, seq_length].
 
-    def _forward_diffusion(self, x_embed: torch.Tensor, 
-                           gamma: torch.Tensor) -> torch.Tensor:
-        """Add noise to embeddings (forward diffusion process)."""
-        gamma = gamma.float()
-        alpha = torch.sigmoid(-gamma).sqrt()[:, None, None]
-        sigma = torch.sigmoid(gamma).sqrt()[:, None, None]
-        noise = torch.randn_like(x_embed)
-        return (x_embed * alpha + noise * sigma).to(x_embed.dtype)
+    sampler='ode': deterministic Euler solver on `num_steps` Gumbel quantiles
+      (num_steps - 1 Euler steps + a final denoising pass = num_steps NFEs).
+    sampler='sde': each of the `num_steps` steps first re-noises z to
+      gamma + sde_offset, denoises there and takes an Euler step; 'elf' starts
+      the Euler step from the original (gamma, z), 'edm' from the re-noised
+      state (num_steps + 1 NFEs). sde_offset=0 recovers the ODE.
+    temperature: scales the logits of every x0 prediction (softmax(logits / T)).
+    """
+    if sampler not in ('ode', 'sde'):
+      raise ValueError(f"sampler must be 'ode' or 'sde', got {sampler!r}")
+    if sampler == 'sde' and sde_mode not in ('elf', 'edm'):
+      raise ValueError(f"sde_mode must be 'elf' or 'edm', got {sde_mode!r}")
+    assert temperature > 0, temperature
+    device = device or next(self.parameters()).device
+    z = torch.randn(num_samples, seq_length, self.backbone.vocab_embed.dim,
+                    device=device)
+    num_points = num_steps if sampler == 'ode' else num_steps + 1
+    gamma = self.proposal(
+      torch.linspace(1.0 - eps, eps, num_points, device=device))
 
-    def _euler_edm_step(self, z: torch.Tensor, x_pred: torch.Tensor,
-                        t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        """Single Euler step for EDM sampling."""
-        t_ = t.double()
-        s_ = s.double()
-        cur = z.double() * ((F.softplus(t_) - F.softplus(s_)) / 2).exp()
-        end = torch.sigmoid(-s_).sqrt() * x_pred.double()
-        z = end.lerp(cur, ((s_ - t_) / 2).exp()).to(z.dtype)
-        return z
-
-    def forward(
-        self,
-        input_ids: typing.Optional[torch.LongTensor] = None,
-        noisy_embeds: typing.Optional[torch.FloatTensor] = None,
-        timesteps: typing.Optional[torch.FloatTensor] = None,
-        x_self_cond: typing.Optional[torch.FloatTensor] = None,
-        output_hidden_states: typing.Optional[bool] = None,
-        return_dict: typing.Optional[bool] = None,
-    ) -> typing.Union[torch.Tensor, typing.Tuple, transformers.modeling_outputs.MaskedLMOutput]:
-        """Forward pass for LangFlow.
-        
-        Args:
-            input_ids: [B, L] - Token IDs (will be embedded and noised if timesteps provided)
-            noisy_embeds: [B, L, D] - Pre-noised embeddings (alternative to input_ids)
-            timesteps: [B] - Gamma values (log-SNR) for conditioning
-            x_self_cond: [B, L, D] - Self-conditioning embeddings
-            output_hidden_states: Whether to return hidden states
-            return_dict: Whether to return MaskedLMOutput
-        
-        Returns:
-            logits or MaskedLMOutput
-        """
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else False
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # Get embeddings
-        if noisy_embeds is not None:
-            z = noisy_embeds
-        elif input_ids is not None:
-            x_embed = self._embed_tokens(input_ids)
-            if timesteps is not None:
-                z = self._forward_diffusion(x_embed, timesteps)
-            else:
-                z = x_embed
+    x_self_cond = None
+    for i in range(num_points - 1):
+      gamma_t, gamma_s = gamma[i], gamma[i + 1]
+      if sampler == 'ode':
+        x_pred = self._x0_pred(z, gamma_t.expand(num_samples), x_self_cond,
+                               temperature)
+        z = self._euler_step(z, x_pred, gamma_t, gamma_s)
+      else:
+        # Step back to a noisier level, denoise there, then step forward.
+        gamma_back = gamma_t + sde_offset
+        alpha_t = torch.sigmoid(-gamma_t).sqrt()
+        alpha_back = torch.sigmoid(-gamma_back).sqrt()
+        sigma_back = torch.sigmoid(gamma_back).sqrt()
+        noise = torch.randn_like(z)
+        offset = torch.as_tensor(sde_offset, device=z.device, dtype=z.dtype)
+        z_back = (alpha_back / alpha_t * z
+                  + sigma_back * torch.sqrt(-torch.expm1(-offset)) * noise)
+        x_pred = self._x0_pred(z_back, gamma_back.expand(num_samples),
+                               x_self_cond, temperature)
+        if sde_mode == 'edm':
+          z = self._euler_step(z_back, x_pred, gamma_back, gamma_s)
         else:
-            raise ValueError("Either input_ids or noisy_embeds must be provided")
+          z = self._euler_step(z, x_pred, gamma_t, gamma_s)
+      if self.self_conditioning:
+        x_self_cond = x_pred
 
-        if timesteps is None:
-            # Use minimum gamma for clean input
-            timesteps = torch.full((z.shape[0],), self.proposal.gamma_min, device=z.device)
+    logits = self.denoise(z, gamma[-1].expand(num_samples), x_self_cond)
+    return logits.argmax(dim=-1)
 
-        # Process sigma
-        sigma = timesteps
-        if sigma.ndim == 2:
-            sigma = sigma.mean(-1)
+  def _x0_and_div(self, z_t, gamma, self_cond, attention_mask=None):
+    """x0 prediction and its Hutchinson divergence estimate w.r.t. z_t."""
+    B = z_t.shape[0]
+    u = torch.randn_like(z_t)
+    if attention_mask is not None:
+      # Padding positions contribute neither to the divergence nor to the ODE.
+      token_mask = attention_mask[:, :, None].to(u.dtype)
+      u = u * token_mask
+    z = z_t.clone().detach().requires_grad_(True)
+    gamma = gamma.expand(B)
+    x_self_cond = None
+    if self_cond != 'off' and self.self_conditioning:
+      x_self_cond = self._embed_tokens(
+        F.softmax(self.denoise(z, gamma), dim=-1))
+      if self_cond == 'detached':
+        x_self_cond = x_self_cond.detach()
+    probs = F.softmax(self.denoise(z, gamma, x_self_cond), dim=-1)
+    x_reconst = self._embed_tokens(probs)
+    if attention_mask is not None:
+      x_reconst = x_reconst * token_mask
+    grad = torch.autograd.grad((u * x_reconst).sum(), z)[0]
+    return x_reconst, (u * grad).sum(dim=[1, 2])
 
-        # Get model output
-        logits, all_hidden_states = self.backbone(
-            z, sigma, x_self_cond=x_self_cond, output_hidden_states=output_hidden_states)
+  def flow_nll(self, x0, num_steps=128, ode_method='heun2',
+               self_cond='attached', attention_mask=None):
+    """Upper bound on the NLL via the probability-flow ODE (per sequence, nats).
 
-        # Add bias (preconditioning) skip connection
-        if self.config.use_bias:
-            c_skip = ((F.softplus(-sigma) - sigma) / 2).exp()
-            embedding = self._get_embedding_matrix()
-            skip_logits = torch.matmul(z.float(), embedding.t().float())
-            logits = logits + c_skip[:, None, None] * skip_logits.to(logits.dtype)
+    NLL = reconstruction CE at gamma_min + divergence integral from gamma_min
+    to gamma_max + Gaussian prior NLL at gamma_max. `self_cond` sets how the
+    self-conditioning input enters the divergence: 'attached' (gradients flow
+    through it, i.e. full chain rule; default), 'detached' (treated as a
+    constant) or 'off' (self-conditioning disabled).
+    """
+    import torchdiffeq  # Only needed for likelihood evaluation.
+    assert self_cond in ('attached', 'detached', 'off'), self_cond
+    B, L = x0.shape
+    dtype = torch.float32
+    with torch.enable_grad():
+      x_embed = self._embed_tokens(x0).to(dtype)
+      D = x_embed.shape[2]
+      gamma_0 = torch.tensor(self.proposal.gamma_min, device=x0.device,
+                             dtype=dtype)
+      sigma_0 = torch.sigmoid(gamma_0).sqrt()
+      z_0 = (torch.sigmoid(-gamma_0).sqrt() * x_embed
+             + sigma_0 * torch.randn_like(x_embed)).detach()
 
-        if return_dict:
-            return transformers.modeling_outputs.MaskedLMOutput(
-                logits=logits,
-                hidden_states=all_hidden_states if output_hidden_states else None,
-                loss=None)
-        elif output_hidden_states:
-            return logits, all_hidden_states
-        else:
-            return logits
+      # 1. Reconstruction loss at gamma_min.
+      x_self_cond = None
+      if self_cond != 'off' and self.self_conditioning:
+        with torch.no_grad():
+          x_self_cond = self._embed_tokens(
+            F.softmax(self.denoise(z_0, gamma_0.expand(B)), dim=-1))
+      logits = self.denoise(z_0, gamma_0.expand(B), x_self_cond)
+      reconst = F.cross_entropy(
+        logits.flatten(0, 1), x0.flatten(), reduction='none'
+      ).reshape(B, L).detach()
+      if attention_mask is not None:
+        reconst = reconst * attention_mask.to(dtype)
+      reconst_nll = reconst.sum(dim=1)
 
-    @torch.no_grad()
-    def generate_samples(
-        self,
-        num_samples: int = 1,
-        seq_length: typing.Optional[int] = None,
-        num_steps: int = 128,
-        device: typing.Optional[torch.device] = None,
-    ) -> torch.LongTensor:
-        """Generate samples using Euler-EDM solver.
-        
-        Args:
-            num_samples: Number of samples to generate
-            seq_length: Sequence length (defaults to config.model_length)
-            num_steps: Number of denoising steps
-            device: Device to generate on
-        
-        Returns:
-            samples: [num_samples, seq_length] - Generated token IDs
-        """
-        if seq_length is None:
-            seq_length = self.config.model_length
-        if device is None:
-            device = next(self.parameters()).device
+      # 2. Divergence integral, solved in (z / sigma, sqrt(SNR)) coordinates.
+      def ode_func(sqrt_snr, y):
+        gamma = -2.0 * torch.log(sqrt_snr)
+        sigma = torch.sigmoid(gamma).sqrt()
+        z_t = y[:, 1:].reshape(B, L, D) * sigma
+        x_reconst, div = self._x0_and_div(z_t, gamma, self_cond, attention_mask)
+        return torch.cat([(sigma * div).view(B, 1), x_reconst.reshape(B, -1)],
+                         dim=1).detach()
 
-        embed_dim = self.config.hidden_size
-        eps = 1e-5
+      y0 = torch.cat([torch.zeros(B, 1, device=x0.device, dtype=dtype),
+                      (z_0 / sigma_0).reshape(B, -1)], dim=1)
+      t_grid = torch.linspace(0.0, 1.0, num_steps + 1, device=x0.device)
+      gamma_grid = self.proposal(t_grid.clamp(min=1e-5, max=1.0 - 1e-5)).to(dtype)
+      y1 = torchdiffeq.odeint(ode_func, y0, torch.exp(-0.5 * gamma_grid),
+                              method=ode_method)[-1]
+      flow_nll = -y1[:, 0].detach()
 
-        # Initialize with Gaussian noise
-        z = torch.randn(num_samples, seq_length, embed_dim, device=device)
+      # 3. Prior NLL at gamma_max (up to the constant shared by all models).
+      z_1 = y1[:, 1:].reshape(B, L, D)
+      if attention_mask is not None:
+        mask = attention_mask.to(dtype)
+        prior_nll = ((0.5 * z_1 ** 2 * mask[:, :, None]).sum(dim=[1, 2])
+                     - mask.sum(dim=1) * D / 2)
+        num_tokens = attention_mask.sum(dim=1).long()
+      else:
+        prior_nll = 0.5 * (z_1 ** 2).sum(dim=[1, 2]) - L * D / 2
+        num_tokens = torch.full((B,), L, dtype=torch.long, device=x0.device)
+    return {'nll': reconst_nll + flow_nll + prior_nll,
+            'reconst_nll': reconst_nll,
+            'flow_nll': flow_nll,
+            'prior_nll': prior_nll,
+            'num_tokens': num_tokens}
 
-        # Create gamma schedule from t=1-eps to t=eps
-        t = torch.linspace(1.0 - eps, eps, num_steps, device=device)
-        gamma = self.proposal(t)
 
-        # Self-conditioning state
-        x_self_cond = None
+class LangFlow(LangFlowMixin, transformers.PreTrainedModel):
+  """HuggingFace LangFlow model (DiT backbone + learnable Gumbel schedule)."""
+  config_class = LangFlowConfig
+  base_model_prefix = 'langflow'
 
-        # Euler-EDM sampling loop
-        for i in range(len(gamma) - 1):
-            gamma_t = gamma[i]
-            gamma_s = gamma[i + 1]
+  def __init__(self, config: LangFlowConfig):
+    super().__init__(config)
+    self.config = config
+    self.backbone = DIT(
+      vocab_size=config.vocab_size,
+      hidden_size=config.hidden_size,
+      cond_dim=config.cond_dim,
+      n_blocks=config.n_blocks,
+      n_heads=config.n_heads,
+      dropout=config.dropout,
+      self_conditioning=config.self_conditioning,
+      normalized_embedding=config.use_normalized_embedding)
+    self.proposal = GumbelProposal(
+      loc=config.gumbel_loc,
+      scale=config.gumbel_scale,
+      cutoff=config.gumbel_cutoff,
+      entropy=config.gumbel_entropy)
 
-            # Get model prediction
-            gamma_expanded = gamma_t.unsqueeze(0).expand(num_samples)
-            logits = self.forward(
-                noisy_embeds=z,
-                timesteps=gamma_expanded,
-                x_self_cond=x_self_cond,
-                return_dict=False)
+  @property
+  def self_conditioning(self):
+    return self.config.self_conditioning
 
-            # Convert logits to embedding prediction
-            probs = F.softmax(logits.float(), dim=-1)
-            x_pred = self._embed_tokens(probs)
+  def _bias_scale(self):
+    return 1.0 if self.config.use_bias else 0.0
 
-            # Update self-conditioning
-            if self.config.self_conditioning:
-                x_self_cond = x_pred
+  def forward(
+      self,
+      input_ids: typing.Optional[torch.LongTensor] = None,
+      noisy_embeds: typing.Optional[torch.FloatTensor] = None,
+      timesteps: typing.Optional[torch.FloatTensor] = None,
+      x_self_cond: typing.Optional[torch.FloatTensor] = None,
+      output_hidden_states: typing.Optional[bool] = None,
+      return_dict: typing.Optional[bool] = None,
+  ) -> typing.Union[torch.Tensor, typing.Tuple,
+                    transformers.modeling_outputs.MaskedLMOutput]:
+    """Clean-token logits.
 
-            # Euler step
-            z = self._euler_edm_step(z, x_pred, gamma_t, gamma_s)
+    Args:
+      input_ids: [B, L] token ids (noised to `timesteps` if given).
+      noisy_embeds: [B, L, D] pre-noised embeddings (alternative to input_ids).
+      timesteps: [B] log-NSR gamma (defaults to gamma_min, i.e. clean input).
+      x_self_cond: [B, L, D] self-conditioning embeddings.
+    """
+    output_hidden_states = bool(output_hidden_states)
+    return_dict = (return_dict if return_dict is not None
+                   else self.config.use_return_dict)
+    if noisy_embeds is not None:
+      z = noisy_embeds
+    elif input_ids is not None:
+      z = self._embed_tokens(input_ids)
+      if timesteps is not None:
+        z = self._forward_diffusion(z, timesteps)
+    else:
+      raise ValueError('Either input_ids or noisy_embeds must be provided')
+    if timesteps is None:
+      timesteps = torch.full((z.shape[0],), self.proposal.gamma_min,
+                             device=z.device)
 
-        # Final step: get logits and take argmax
-        gamma_final = gamma[-1]
-        gamma_expanded = gamma_final.unsqueeze(0).expand(num_samples)
-        logits = self.forward(
-            noisy_embeds=z,
-            timesteps=gamma_expanded,
-            x_self_cond=x_self_cond,
-            return_dict=False)
-        samples = logits.argmax(dim=-1)
+    logits, hidden_states = self.denoise(
+      z, timesteps, x_self_cond, output_hidden_states=True)
+    if return_dict:
+      return transformers.modeling_outputs.MaskedLMOutput(
+        logits=logits,
+        hidden_states=hidden_states if output_hidden_states else None,
+        loss=None)
+    if output_hidden_states:
+      return logits, hidden_states
+    return logits
 
-        return samples
+  @torch.no_grad()
+  def generate_samples(self, num_samples=1, seq_length=None, num_steps=128,
+                       device=None, sampler='ode', temperature=1.0,
+                       sde_offset=0.1, sde_mode='elf'):
+    """Generates token ids [num_samples, seq_length]; see `LangFlowMixin.sample`."""
+    return self.sample(
+      num_samples=num_samples,
+      seq_length=seq_length or self.config.model_length,
+      num_steps=num_steps,
+      sampler=sampler,
+      temperature=temperature,
+      sde_offset=sde_offset,
+      sde_mode=sde_mode,
+      device=device)

@@ -1,0 +1,14 @@
+# LangFlow on OpenWebText (paper setting): 1024 tokens, GPT-2 tokenizer,
+# 1024 sampling steps.
+defaults:
+  - config
+  - override algo: langflow
+  - override data: openwebtext-split
+  - _self_
+
+model:
+  length: 1024
+
+sampling:
+  predictor: ode
+  steps: 1024

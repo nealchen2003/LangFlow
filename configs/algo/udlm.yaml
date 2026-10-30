@@ -1,0 +1,8 @@
+name: udlm
+backbone: dit  # dit / hf_dit
+parameterization: mean
+time_conditioning: True
+T: 0
+causal_attention: False
+ignore_bos: False
+loss_type: elbo  # elbo, low_var

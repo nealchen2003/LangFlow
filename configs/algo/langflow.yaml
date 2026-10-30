@@ -1,0 +1,22 @@
+name: langflow
+backbone: dit
+parameterization: continuous
+time_conditioning: True
+T: 0
+causal_attention: False
+ignore_bos: False
+# Unit-norm token embeddings scaled by sqrt(hidden_size).
+normalized_embedding: True
+# Self-conditioning, applied with this probability during training.
+self_conditioning: True
+self_cond_prob: 0.25
+# Preconditioning skip connection c_skip(gamma) * z @ E^T, linearly warmed up
+# over this many steps (null disables it).
+bias_warmup: 5000
+# Gumbel noise schedule over gamma (log-NSR), clipped to its cutoff quantiles.
+# With learnable_schedule, loc / scale / entropy are fitted to the loss.
+learnable_schedule: True
+gumbel_loc: 4.723
+gumbel_scale: 0.852
+gumbel_cutoff: 1.0e-5
+gumbel_entropy: 7.02

@@ -1,0 +1,7 @@
+name: ar
+backbone: dit
+parameterization: ar
+time_conditioning: False
+causal_attention: True
+T: 0
+ignore_bos: False

@@ -1,0 +1,14 @@
+# LangFlow on LM1B (paper setting): 128 tokens with sentence packing,
+# bert-base-uncased tokenizer, 128 sampling steps.
+defaults:
+  - config
+  - override algo: langflow
+  - override data: lm1b-wrap
+  - _self_
+
+model:
+  length: 128
+
+sampling:
+  predictor: ode
+  steps: 128

@@ -1,20 +1,112 @@
 defaults:
   - _self_
-  - /data: openwebtext
+  - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
+  - /data: openwebtext-split
+  - /model: small
+  - /strategy: ddp
+  - /lr_scheduler: constant_warmup
+  - /algo: langflow
+
+mode: train  # train / ppl_eval / sample_eval
 
 seed: 1
 
 loader:
   global_batch_size: 512
-  eval_global_batch_size: 512
+  eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
-  batch_size: 128
-  eval_batch_size: 128
+  batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   num_workers: 16
   pin_memory: True
 
+sampling:
+  # ar: (ignored) / mdlm: ancestral_cache / sedd: analytic / udlm, duo: ancestral
+  # langflow: ode / sde
+  predictor: ode
+  steps: 1000
+  noise_removal: ancestral  # Discrete diffusion: 'ancestral', 'greedy', 'none'
+  use_float64: True
+  p_nucleus: 1.0
+  # LangFlow: every x0 prediction is E^T softmax(logits / temperature).
+  temperature: 1.0
+  # LangFlow SDE sampler: re-noising offset in log-NSR (0 recovers the ODE) and
+  # whether the Euler step starts from the original (elf) or re-noised (edm) state.
+  sde_offset: 0.1
+  sde_mode: elf
+  num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  num_sample_log: 2
+
+training:
+  ema: 0.9999
+  antithetic_sampling: True
+  sampling_eps: 1e-3
+  finetune_path: ''
+
 eval:
-  checkpoint_path: ''  # Used to evaluate a checkpoint after training.
+  # .ckpt checkpoint; for LangFlow also released HuggingFace weights
+  # (a model.safetensors file, a directory or a Hub repo id).
+  checkpoint_path: ''
   disable_ema: False
-  n_steps: 128
-  ode_method: heun2
+  compute_generative_perplexity: False
+  perplexity_batch_size: 8
+  compute_perplexity_on_sanity: False
+  gen_ppl_eval_model_name_or_path: gpt2-large
+  generate_samples: True
+  generated_samples_path: ${cwd:}/samples.json
+  # LangFlow perplexity in mode=ppl_eval: `ode` (probability-flow ODE bound) or
+  # `sde` (variational bound, as reported during training).
+  ppl_bound: ode
+  # Self-conditioning in the ODE bound: `attached` (gradients through the
+  # self-conditioning input), `detached` (treated as constant) or `off`.
+  self_cond: attached
+  ode_steps: 128
+  ode_method: heun2  # any fixed-grid torchdiffeq method
+
+optim:
+  weight_decay: 0
+  lr: 3e-4
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+
+trainer:
+  _target_: lightning.Trainer
+  accelerator: cuda
+  num_nodes: 1
+  devices: ${device_count:}
+  accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
+  gradient_clip_val: 1.0
+  precision: 'bf16'
+  num_sanity_val_steps: 2
+  max_steps: 1_000_000
+  log_every_n_steps: 100
+  limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
+  limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
+  val_check_interval: 5000
+
+wandb:
+  project: langflow
+  entity: null
+  name: ${algo.name}-${data.train}
+  group: null
+  mode: online
+  id: null
+  job_type: null
+  tags:
+    - ${data.train}
+    - ${data.valid}
+    - ${algo.name}
+
+hydra:
+  run:
+    dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
+  job:
+    chdir: true
+
+checkpointing:
+  # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
+  save_dir: ${cwd:}
+  # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
+  resume_from_ckpt: true
+  resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

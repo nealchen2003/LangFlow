@@ -1,0 +1,7 @@
+name: tiny
+hidden_size: 256
+cond_dim: 128
+length: 1024
+n_blocks: 8
+n_heads: 8
+dropout: 0.1

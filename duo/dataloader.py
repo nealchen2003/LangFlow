@@ -23,6 +23,31 @@ from duo import utils
 LOGGER = utils.get_logger(__name__)
 
 
+def _all_ids_in_vocab(input_ids, vocab_size: int) -> bool:
+  """Whether all input_ids of a sample lie in [0, vocab_size)."""
+  if isinstance(input_ids, torch.Tensor):
+    ids = input_ids
+  else:
+    ids = torch.tensor(input_ids)
+  return bool((ids >= 0).all().item() and (ids < vocab_size).all().item())
+
+
+def _filter_oob_tokens(dataset, tokenizer):
+  """Drops samples with token ids outside the vocabulary (out-of-range embedding lookups)."""
+  vocab_size = getattr(tokenizer, 'vocab_size', None) or len(tokenizer)
+
+  def keep(example):
+    return _all_ids_in_vocab(example['input_ids'], vocab_size)
+
+  n_before = len(dataset)
+  dataset = dataset.filter(keep, desc='Filter OOB token ids')
+  n_removed = n_before - len(dataset)
+  if n_removed > 0:
+    LOGGER.info(
+        f'Filtered out {n_removed} samples with OOB token ids (vocab_size={vocab_size}).')
+  return dataset
+
+
 def wt_detokenizer(string):
   # contractions
   string = string.replace("s '", "s'")
@@ -432,7 +457,9 @@ def get_dataset(dataset_name,
   
   if utils.fsspec_exists(_path):
     LOGGER.info(f'Loading data from: {_path}')
-    return datasets.load_from_disk(_path).with_format('torch')
+    ds = datasets.load_from_disk(_path)
+    ds = _filter_oob_tokens(ds, tokenizer)
+    return ds.with_format('torch')
   LOGGER.info(f'Generating new data at: {_path}')
   LOGGER.info(f'{streaming=}')  
 
@@ -609,6 +636,7 @@ def get_dataset(dataset_name,
       'text')
 
   if not wrap:
+    tokenized_dataset = _filter_oob_tokens(tokenized_dataset, tokenizer)
     if not streaming:
       tokenized_dataset.save_to_disk(_path)
     return tokenized_dataset.with_format('torch')
@@ -626,6 +654,7 @@ def get_dataset(dataset_name,
       num_proc=num_proc,
       load_from_cache_file=True,
       desc='Grouping')
+    chunked_dataset = _filter_oob_tokens(chunked_dataset, tokenizer)
     chunked_dataset.save_to_disk(_path)
   chunked_dataset = chunked_dataset.with_format('torch')
   return chunked_dataset
@@ -673,21 +702,21 @@ def get_tokenizer(config):
 def get_dataloaders(config, tokenizer, skip_train=False,
                     skip_valid=False, valid_seed=None):
   num_gpus = torch.cuda.device_count()
-  # assert (config.loader.global_batch_size
-  #         == (config.loader.batch_size
-  #             * config.trainer.num_nodes
-  #             * num_gpus
-  #             * config.trainer.accumulate_grad_batches))
-  # if config.loader.global_batch_size % (
-  #   num_gpus * config.trainer.accumulate_grad_batches) != 0:
-  #   raise ValueError(
-  #     f'Train Batch Size {config.training.batch_size}'
-  #     f'not divisible by {num_gpus} gpus with accumulation '
-  #     f'{config.trainer.accumulate_grad_batches}.')
-  # if config.loader.eval_global_batch_size % num_gpus != 0:
-  #   raise ValueError(
-  #     f'Eval Batch Size for {config.eval.batch_size} '
-  #     f'not divisible by {num_gpus}.')
+  assert (config.loader.global_batch_size
+          == (config.loader.batch_size
+              * config.trainer.num_nodes
+              * num_gpus
+              * config.trainer.accumulate_grad_batches))
+  if config.loader.global_batch_size % (
+    num_gpus * config.trainer.accumulate_grad_batches) != 0:
+    raise ValueError(
+      f'Train Batch Size {config.training.batch_size}'
+      f'not divisible by {num_gpus} gpus with accumulation '
+      f'{config.trainer.accumulate_grad_batches}.')
+  if config.loader.eval_global_batch_size % num_gpus != 0:
+    raise ValueError(
+      f'Eval Batch Size for {config.eval.batch_size} '
+      f'not divisible by {num_gpus}.')
   if skip_train:
     train_set = None
   else:
