@@ -297,7 +297,7 @@ def get_lambada_test_dataset():
     url = "https://openaipublic.blob.core.windows.net/gpt-2/data/lambada_test.jsonl"
 
     def read_jsonl_to_list(url):
-      response = requests.get(url, stream=True)
+      response = requests.get(url, stream=True, timeout=30)
       data_list = []
 
       # Process each line in the response content
